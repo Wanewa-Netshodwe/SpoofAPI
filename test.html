@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Face Spoof Detection</title>
+  </head>
+  <body>
+    <h1>Upload Video for Face Anti-Spoof Detection</h1>
+    <form id="upload-form">
+      <input type="file" id="video" name="video" accept="video/*" required />
+      <button type="submit">Submit</button>
+    </form>
+
+    <p id="response"></p>
+
+    <script>
+      document
+        .getElementById("upload-form")
+        .addEventListener("submit", async function (e) {
+          e.preventDefault();
+
+          const formData = new FormData();
+          const fileInput = document.getElementById("video");
+          formData.append("video", fileInput.files[0]);
+
+          try {
+            const response = await fetch("http://localhost:5000/predict", {
+              method: "POST",
+              body: formData,
+            });
+
+            const result = await response.json();
+            document.getElementById(
+              "response"
+            ).innerText = `Prediction: ${result.prediction}`;
+          } catch (err) {
+            console.error(err);
+            document.getElementById("response").innerText =
+              "Error sending video to server.";
+          }
+        });
+    </script>
+  </body>
+</html>
