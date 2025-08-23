@@ -3,8 +3,6 @@ from flask_cors import CORS
 import requests
 import cv2
 import numpy as np
-import torch
-from src.anti_spoof_predict import AntiSpoofPredict
 import os
 import tempfile
 from deepface import DeepFace
@@ -12,18 +10,14 @@ import base64
 from io import BytesIO
 from PIL import Image
 import subprocess
+import traceback
 
 app = Flask(__name__)
 CORS(app)
 
-# Initialize model
-device_id = 0
-model_path = "./resources/anti_spoof_models/2.7_80x80_MiniFASNetV2.pth"
-anti_spoof_predictor = AntiSpoofPredict(device_id)
-anti_spoof_predictor._load_model(model_path)
-
 
 def read_video_frames(video_path):
+    """Extract all frames from a video."""
     cap = cv2.VideoCapture(video_path)
     frames = []
     while True:
@@ -36,14 +30,19 @@ def read_video_frames(video_path):
 
 
 def base64_to_image(base64_str):
-    if "base64," in base64_str:
-        base64_str = base64_str.split("base64,")[1]
-    img_data = base64.b64decode(base64_str)
-    img = Image.open(BytesIO(img_data))
-    return np.array(img)
+    """Convert base64 string to numpy image."""
+    try:
+        if "base64," in base64_str:
+            base64_str = base64_str.split("base64,")[1]
+        img_data = base64.b64decode(base64_str)
+        img = Image.open(BytesIO(img_data))
+        return np.array(img)
+    except Exception as e:
+        raise ValueError(f"Invalid base64 image: {str(e)}")
 
 
 def convert_to_mp4(input_path, output_path):
+    """Convert video to mp4 using ffmpeg."""
     try:
         subprocess.run([
             "ffmpeg",
@@ -53,106 +52,95 @@ def convert_to_mp4(input_path, output_path):
             "-c:a", "aac",
             "-strict", "experimental",
             output_path
-        ], check=True)
+        ], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         return True
     except subprocess.CalledProcessError as e:
-        print("FFmpeg conversion error:", e)
+        print("FFmpeg conversion error:", e.stderr.decode())
         return False
 
 
-@app.route('/predict', methods=['POST'])
+@app.route('/api/predict', methods=['POST'])
 def predict():
-    if 'video' not in request.files:
-        return jsonify({"error": "No video file provided"}), 400
-
-    video_file = request.files['video']
-    student_number = request.form.get('student_number') or (request.json and request.json.get('student_number'))
-    if not student_number:
-        return jsonify({"error": "student_number is required"}), 400
-
-    temp_dir = tempfile.mkdtemp()
-    temp_webm_path = os.path.join(temp_dir, "input_video.webm")
-    temp_mp4_path = os.path.join(temp_dir, "input_video.mp4")
-
-    video_file.save(temp_webm_path)
-
-    # Convert WebM to MP4
-    if not convert_to_mp4(temp_webm_path, temp_mp4_path):
-        return jsonify({"error": "Failed to convert video"}), 500
-
+    temp_dir = None
     try:
+        # Check input
+        if 'video' not in request.files:
+            return jsonify({"error": "No video file provided"}), 400
+
+        video_file = request.files['video']
+        student_number = request.form.get('student_number') or (request.json and request.json.get('student_number'))
+        if not student_number:
+            return jsonify({"error": "student_number is required"}), 400
+
+        # Prepare temp files
+        temp_dir = tempfile.mkdtemp()
+        temp_webm_path = os.path.join(temp_dir, "input_video.webm")
+        temp_mp4_path = os.path.join(temp_dir, "input_video.mp4")
+        video_file.save(temp_webm_path)
+
+        # Convert to mp4
+        if not convert_to_mp4(temp_webm_path, temp_mp4_path):
+            return jsonify({"error": "Failed to convert video"}), 500
+
+        # Extract frames
         frames = read_video_frames(temp_mp4_path)
         if not frames:
             return jsonify({"error": "Could not read video frames"}), 400
 
-        # Use middle frame for face cropping
+        # Use middle frame
         frame = frames[len(frames) // 2]
-        bbox = anti_spoof_predictor.get_bbox(frame)
-        x, y, w, h = bbox
 
-        face_img = frame[y:y+h, x:x+w]
-        face_img = cv2.resize(face_img, (80, 80))
+        # Call Node API for reference face
+        NODE_URL = "http://localhost:3001/api/faceRec/employee_face"
+        headers = {"secret": "da_SeCret"}
+        payload = {"student_number": student_number}
+        node_response = requests.post(NODE_URL, json=payload, headers=headers)
 
-        prediction = anti_spoof_predictor.predict(face_img, model_path)
-        prob_real = float(prediction[0][0])
-        prob_spoof = float(prediction[0][1])
-        result = "real" if prob_real > prob_spoof else "spoof"
-
-        if result == "spoof":
-            NODE_URL = "http://localhost:3001/api/faceRec/employee_face"
-            headers = {"secret": "da_SeCret"}
-            payload = {"student_number": student_number}
-            node_response = requests.post(NODE_URL, json=payload, headers=headers)
-
-            if node_response.status_code == 201:
-                data = node_response.json()
-                node_face_base64 = data.get("image_base64")
-                if not node_face_base64:
-                    return jsonify({"error": "Node API did not return face image"}), 500
-
-                node_face_img = base64_to_image(node_face_base64)
-                node_face_img = cv2.resize(node_face_img, (80, 80))
-
-                # Convert BGR to RGB for DeepFace
-                face_img_rgb = cv2.cvtColor(face_img, cv2.COLOR_BGR2RGB)
-                node_face_img_rgb = cv2.cvtColor(node_face_img, cv2.COLOR_BGR2RGB)
-
-                try:
-                    verification = DeepFace.verify(face_img_rgb, node_face_img_rgb, enforce_detection=False)
-                    return jsonify({
-                        "result": result,
-                        "prob_real": prob_real,
-                        "prob_spoof": prob_spoof,
-                        "node_response": data,
-                        "face_match": verification['verified'],
-                        "distance": verification['distance']
-                    })
-                except Exception as e:
-                    return jsonify({"error": f"DeepFace verification failed: {str(e)}"}), 500
-            else:
-                return jsonify({
-                    "error": "Node API call failed",
-                    "status_code": node_response.status_code,
-                    "response": node_response.text
-                }), 500
-        else:
+        if node_response.status_code != 201:
             return jsonify({
-                "result": result,
-                "prob_real": prob_real,
-                "prob_spoof": prob_spoof
-            })
+                "error": "Node API call failed",
+                "status_code": node_response.status_code,
+                "response": node_response.text
+            }), 500
+
+        data = node_response.json()
+        node_face_base64 = data.get("image_base64")
+        if not node_face_base64:
+            return jsonify({"error": "Node API did not return face image"}), 500
+
+        # Decode face from Node
+        node_face_img = base64_to_image(node_face_base64)
+
+        # Convert to RGB for DeepFace
+        face_img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        node_face_img_rgb = cv2.cvtColor(node_face_img, cv2.COLOR_BGR2RGB)
+
+        # DeepFace verification
+        verification = DeepFace.verify(face_img_rgb, node_face_img_rgb, enforce_detection=False)
+
+        return jsonify({
+            "result": "verified" if verification['verified'] else "not_verified",
+            "distance": verification['distance'],
+             "face_match": verification['verified'],
+            "node_response": data
+        })
 
     except Exception as e:
+        traceback.print_exc()
         return jsonify({"error": str(e)}), 500
-    finally:
-        # Clean up temporary files
-        for f in [temp_webm_path, temp_mp4_path]:
-            if os.path.exists(f):
-                os.remove(f)
-        if os.path.exists(temp_dir):
-            os.rmdir(temp_dir)
 
+    finally:
+        # Cleanup
+        if temp_dir and os.path.exists(temp_dir):
+            for f in os.listdir(temp_dir):
+                try:
+                    os.remove(os.path.join(temp_dir, f))
+                except:
+                    pass
+            try:
+                os.rmdir(temp_dir)
+            except:
+                pass
 
 if __name__ == '__main__':
-    
-    app.run(debug=True)
+    app.run(host="0.0.0.0", port=5000)
