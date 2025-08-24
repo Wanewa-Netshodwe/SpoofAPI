@@ -91,7 +91,7 @@ def predict():
         frame = frames[len(frames) // 2]
 
         # Call Node API for reference face
-        NODE_URL = "http://localhost:3001/api/faceRec/employee_face"
+        NODE_URL = "https://areyouhere.online/api/faceRec/employee_face"
         headers = {"secret": "da_SeCret"}
         payload = {"student_number": student_number}
         node_response = requests.post(NODE_URL, json=payload, headers=headers)
